@@ -359,6 +359,9 @@ enum eventTypes {
     RNG_CHECK,
     END_OF_RECORDING,
     EVENT_ERROR,
+    WIZARD_CREATE_GOLD,
+    WIZARD_CREATE_ITEM,
+    WIZARD_CREATE_MONSTER,
     NUMBER_OF_EVENT_TYPES, // unused
 };
 
@@ -370,12 +373,39 @@ enum notificationEventTypes {
 	GAMEOVER_RECORDING
 };
 
+// Stored field-by-field in recordings, never as raw structure memory.
+#define WIZARD_DEFAULT_ENCHANT (-128)
+typedef struct wizardItemOptions {
+    int category; // category bit index, not its bit mask
+    int kind;
+    int runic; // raw catalog index; retained even when the runic flag is clear
+    boolean hasRunic;
+    int vorpalEnemy;
+    int enchant; // WIZARD_DEFAULT_ENCHANT retains generated/default values
+    boolean identify;
+} wizardItemOptions;
+
+enum wizardMonsterOutcome {
+    WIZARD_MONSTER_CANCELED,
+    WIZARD_MONSTER_INVALID_LOCATION,
+    WIZARD_MONSTER_PLACED
+};
+typedef struct wizardMonsterOptions {
+    int kind;
+    int mutation; // -1 means no mutation
+    pos location;
+    enum wizardMonsterOutcome outcome;
+    boolean ally;
+} wizardMonsterOptions;
+
 typedef struct rogueEvent {
     enum eventTypes eventType;
     signed long param1;
     signed long param2;
     boolean controlKey;
     boolean shiftKey;
+    wizardItemOptions wizardItem;
+    wizardMonsterOptions wizardMonster;
 } rogueEvent;
 
 typedef struct rogueHighScoresEntry {
@@ -2497,6 +2527,7 @@ typedef struct playerCharacter {
 
     // recording info
     boolean recording;                  // whether we are recording the game
+    boolean wizardRecordingEvents;      // requires the extended wizard recording format
     boolean playbackMode;               // whether we're viewing a recording instead of playing
     unsigned short patchVersion;        // what patch version of the game this was recorded on
     char versionString[16];             // the version string saved into the recording file
@@ -3493,6 +3524,11 @@ extern "C" {
 
     boolean dialogChooseFile(char *path, const char *suffix, const char *prompt);
     void dialogCreateItemOrMonster(void);
+    void wizardCreateGold(void);
+    void wizardCreateItem(wizardItemOptions *options);
+    boolean wizardItemOptionsValid(const wizardItemOptions *options);
+    void wizardCreateMonster(wizardMonsterOptions *options);
+    boolean wizardMonsterOptionsValid(const wizardMonsterOptions *options);
     int quitImmediately(void);
     void dialogAlert(char *message);
     void mainBrogueJunction(void);

@@ -195,7 +195,7 @@ static short dialogCreateItemChooseKind(enum itemCategory category) {
 
 // Display an input dialog for the user to enter the enchantment level for the item being created.
 // Assigns the enchantment level to the item. Does not return a value.
-static void dialogCreateItemChooseEnchantmentLevel(item *theItem) {
+static void dialogCreateItemChooseEnchantmentLevel(item *theItem, wizardItemOptions *options) {
     short minVal = 0, maxVal = 50, defaultVal, maxInputLength = 2;
     char prompt[100], buf[100], inputBuf[100]="";
 
@@ -231,11 +231,16 @@ static void dialogCreateItemChooseEnchantmentLevel(item *theItem) {
         }
     }
 
-    sprintf(prompt, "How many enchants (%d to %d) [default %d]?", minVal, maxVal, defaultVal);
-    getInputTextString(inputBuf, prompt, maxInputLength, "", "", TEXT_INPUT_NORMAL, true);
+    if (!rogue.playbackMode) {
+        sprintf(prompt, "How many enchants (%d to %d) [default %d]?", minVal, maxVal, defaultVal);
+        getInputTextString(inputBuf, prompt, maxInputLength, "", "", TEXT_INPUT_NORMAL, true);
+    }
 
-    // Validate the input
+    // Resolve user input only when live; replay still performs the RNG preparation above.
     int enchants;
+    if (rogue.playbackMode && options->enchant != WIZARD_DEFAULT_ENCHANT) {
+        sprintf(inputBuf, "%d", options->enchant);
+    }
     if (strlen(inputBuf)                      // we need some input
         && sscanf(inputBuf, "%d", &enchants)  // try to convert to number
         && sprintf(buf, "%d", enchants)       // convert back to string
@@ -246,6 +251,8 @@ static void dialogCreateItemChooseEnchantmentLevel(item *theItem) {
         } else if (enchants < minVal) {
             enchants = defaultVal;
         }
+
+        options->enchant = enchants;
 
         // set enchantment level based on item category
         if (theItem->category == WAND) {
@@ -277,7 +284,7 @@ static int creatureTypeCompareMonsterNames (const void * a, const void * b) {
 }
 
 // Display a dialog window for the user to select a mutation for the specified monster.
-static void dialogCreateMonsterChooseMutation(creature *theMonster) {
+static int dialogCreateMonsterChooseMutation(creature *theMonster) {
     char buttonText[COLS];
     short i, j = 0, noMutation, selectedMutation;
     brogueButton buttons[DIALOG_CREATE_ITEM_MAX_BUTTONS];
@@ -299,21 +306,19 @@ static void dialogCreateMonsterChooseMutation(creature *theMonster) {
 
     if (selectedMutation >= 0 && selectedMutation != noMutation) {
         mutateMonster(theMonster, buttons[selectedMutation].command); // Retrieve the mutation index from the button
+        return buttons[selectedMutation].command;
     }
+    return -1;
 }
 
 // Display a series of dialog windows for creating an arbitrary monster chosen by the user
 static void dialogCreateMonster() {
     brogueButton buttons[DIALOG_CREATE_ITEM_MAX_BUTTONS];
     char buttonText[COLS];
-    pos selectedPosition;
-    boolean locationIsValid = true;
     short i, j=0, selectedMonster, monsterOffset, buttonCount=0;
     const short MONSTERS_PER_PAGE = 24;
     const short CREATABLE_MONSTER_KINDS = NUMBER_MONSTER_KINDS - 2;
-    char theMessage[COLS] = "";
     char monsterRangeText[COLS];
-    creature *theMonster, *oldMonster;
     creatureType monsterKinds[NUMBER_MONSTER_KINDS];
 
     // There are too many monsters to fit on a page so we break them into ranges. First we copy the monster catalog and
@@ -362,78 +367,145 @@ static void dialogCreateMonster() {
 
     selectedMonster+= monsterOffset;
 
-    theMonster = generateMonster(monsterKinds[selectedMonster].monsterID, false, false);
+    wizardMonsterOptions options = {0};
+    options.kind = monsterKinds[selectedMonster].monsterID;
+    options.mutation = -1;
+    wizardCreateMonster(&options);
+}
 
-    // Choose a mutation
-    if (!(theMonster->info.flags & MONST_NEVER_MUTATED) && !(theMonster->info.abilityFlags & MA_NEVER_MUTATED)) {
-        dialogCreateMonsterChooseMutation(theMonster);
+static boolean wizardMonsterLocationValid(int kind, pos location) {
+    if (location.x < 0 || location.x >= DCOLS || location.y < 0 || location.y >= DROWS
+        || !playerCanSeeOrSense(location.x, location.y) || posEq(location, player.loc)) {
+        return false;
     }
+    if (monsterCatalog[kind].displayChar == G_TURRET) {
+        return pmapAt(location)->layers[DUNGEON] == WALL;
+    }
+    return !cellHasTerrainFlag(location, T_OBSTRUCTS_PASSABILITY);
+}
+
+boolean wizardMonsterOptionsValid(const wizardMonsterOptions *o) {
+    if (o->kind < 0 || o->kind >= NUMBER_MONSTER_KINDS
+        || o->kind == MK_LICH || o->kind == MK_PHOENIX
+        || o->mutation < -1 || o->mutation >= NUMBER_MUTATORS
+        || o->outcome < WIZARD_MONSTER_CANCELED || o->outcome > WIZARD_MONSTER_PLACED) {
+        return false;
+    }
+    const creatureType *type = &monsterCatalog[o->kind];
+    if (o->mutation >= 0 && ((type->flags & MONST_NEVER_MUTATED)
+        || (type->abilityFlags & MA_NEVER_MUTATED)
+        || (type->flags & mutationCatalog[o->mutation].forbiddenFlags)
+        || (type->abilityFlags & mutationCatalog[o->mutation].forbiddenAbilityFlags))) {
+        return false;
+    }
+    if (o->outcome == WIZARD_MONSTER_CANCELED) return !o->ally;
+    if (o->location.x < 0 || o->location.x >= DCOLS
+        || o->location.y < 0 || o->location.y >= DROWS) {
+        return false;
+    }
+    boolean valid = wizardMonsterLocationValid(o->kind, o->location);
+    if (o->outcome == WIZARD_MONSTER_INVALID_LOCATION) return !valid && !o->ally;
+    if (!valid) {
+        return false;
+    }
+    if (o->ally && (type->flags & (MONST_INANIMATE | MONST_INVULNERABLE))
+        && o->kind != MK_PHOENIX_EGG && o->kind != MK_PHYLACTERY) {
+        return false;
+    }
+    return true;
+}
+
+void wizardCreateMonster(wizardMonsterOptions *options) {
+    char text[COLS];
+    rogueEvent event = {0};
+    if (!WIZARD_MODE || !wizardMonsterOptionsValid(options)) return;
+    creature *theMonster = generateMonster(options->kind, false, false);
+    if (!rogue.playbackMode) {
+        if (!(theMonster->info.flags & MONST_NEVER_MUTATED)
+            && !(theMonster->info.abilityFlags & MA_NEVER_MUTATED)) {
+            options->mutation = dialogCreateMonsterChooseMutation(theMonster);
+        }
+    } else if (options->mutation >= 0) mutateMonster(theMonster, options->mutation);
     initializeMonster(theMonster, false);
-    
-    if (theMonster->info.displayChar == G_TURRET) {
-        sprintf(theMessage, "Create %s where? Choose a visible wall.", theMonster->info.monsterName);
-    } else {
-        sprintf(theMessage, "Create %s where? Choose a visible unobstructed location.", theMonster->info.monsterName);
-    }
-    temporaryMessage(theMessage, REFRESH_SIDEBAR);
-
-    // pick a location
-    if (chooseTarget(&selectedPosition, 0, AUTOTARGET_MODE_NONE, NULL)) {
-        confirmMessages();
-
-        if (!playerCanSeeOrSense(selectedPosition.x, selectedPosition.y)) {
-            locationIsValid = false;
-        }
-        if (theMonster->info.displayChar == G_TURRET && (!(pmapAt(selectedPosition)->layers[DUNGEON] == WALL))) {
-            locationIsValid = false;
-        }
-        if (!(theMonster->info.displayChar == G_TURRET) && cellHasTerrainFlag(selectedPosition, T_OBSTRUCTS_PASSABILITY)) {
-            locationIsValid = false;
-        }
-
-        if (!locationIsValid) {
-            sprintf(theMessage, "Invalid location. %s", KEYBOARD_LABELS ? "-- Press space or click to continue --" : "-- Touch anywhere to continue --");
-            temporaryMessage(theMessage, REQUIRE_ACKNOWLEDGMENT);
-            killCreature(theMonster, true);
-            removeDeadMonsters();
-            return;
-        }
-
-        // If there's already a monster here, quietly bury the body.
-        oldMonster = monsterAtLoc(selectedPosition);
-        if (oldMonster) {
-            killCreature(oldMonster, true);
-            removeDeadMonsters();
-        }
-
-        theMonster->loc = selectedPosition;
-        pmapAt(theMonster->loc)->flags |= HAS_MONSTER;
-        theMonster->creatureState = MONSTER_WANDERING;
-        fadeInMonster(theMonster);
-        refreshSideBar(-1, -1, false);
-        refreshDungeonCell(theMonster->loc);
-
-        if (!(theMonster->info.flags & (MONST_INANIMATE | MONST_INVULNERABLE))
-            || theMonster->info.monsterID == MK_PHOENIX_EGG
-            || theMonster->info.monsterID == MK_PHYLACTERY
-                ) {
-            sprintf(theMessage, "Make the %s your ally?", theMonster->info.monsterName);
-            if (confirm(theMessage, false)) {
-                becomeAllyWith(theMonster);
-                sprintf(theMessage, "Allied %s created.", theMonster->info.monsterName);
-            } else {
-                sprintf(theMessage, "%s created.", theMonster->info.monsterName);
-            }
+    if (!rogue.playbackMode) {
+        sprintf(
+            text, "Create %s where? Choose a visible %s.", theMonster->info.monsterName,
+            theMonster->info.displayChar == G_TURRET ? "wall" : "unobstructed location"
+        );
+        temporaryMessage(text, REFRESH_SIDEBAR);
+        if (!chooseTarget(&options->location, 0, AUTOTARGET_MODE_NONE, NULL)) {
+            options->location = (pos){0, 0};
+            options->outcome = WIZARD_MONSTER_CANCELED;
         } else {
-            sprintf(theMessage, "%s created.", theMonster->info.monsterName);
+            options->outcome = wizardMonsterLocationValid(options->kind, options->location)
+                ? WIZARD_MONSTER_PLACED : WIZARD_MONSTER_INVALID_LOCATION;
         }
-        message(theMessage, 0);
-    } else {  // no location chosen
-        confirmMessages();
+    }
+    confirmMessages();
+    if (options->outcome != WIZARD_MONSTER_PLACED) {
+        if (options->outcome == WIZARD_MONSTER_INVALID_LOCATION && !rogue.playbackMode) {
+            sprintf(
+                text, "Invalid location. %s",
+                KEYBOARD_LABELS ? "-- Press space or click to continue --"
+                    : "-- Touch anywhere to continue --"
+            );
+            temporaryMessage(text, REQUIRE_ACKNOWLEDGMENT);
+        }
+        event.eventType = WIZARD_CREATE_MONSTER;
+        event.wizardMonster = *options;
+        recordEvent(&event);
         killCreature(theMonster, true);
         removeDeadMonsters();
+        if (options->outcome == WIZARD_MONSTER_CANCELED) refreshSideBar(-1, -1, false);
+        return;
     }
+    creature *oldMonster = monsterAtLoc(options->location);
+    if (oldMonster) { killCreature(oldMonster, true); removeDeadMonsters(); }
+    theMonster->loc = options->location;
+    pmapAt(theMonster->loc)->flags |= HAS_MONSTER;
+    theMonster->creatureState = MONSTER_WANDERING;
+    fadeInMonster(theMonster);
     refreshSideBar(-1, -1, false);
+    refreshDungeonCell(theMonster->loc);
+    if (!(theMonster->info.flags & (MONST_INANIMATE | MONST_INVULNERABLE))
+        || theMonster->info.monsterID == MK_PHOENIX_EGG
+        || theMonster->info.monsterID == MK_PHYLACTERY) {
+        if (!rogue.playbackMode) {
+            sprintf(text, "Make the %s your ally?", theMonster->info.monsterName);
+            options->ally = confirm(text, false);
+        }
+        if (options->ally) becomeAllyWith(theMonster);
+    }
+    event.eventType = WIZARD_CREATE_MONSTER;
+    event.wizardMonster = *options;
+    recordEvent(&event);
+    sprintf(text, "%s%s created.", options->ally ? "Allied " : "", theMonster->info.monsterName);
+    message(text, 0);
+    refreshSideBar(-1, -1, false);
+}
+
+
+// Shared by the interactive wizard command and recording playback. Generate the
+// quantity again rather than recording it, preserving substantive RNG consumption.
+void wizardCreateGold(void) {
+    item *theItem;
+    char text[COLS];
+    rogueEvent event = {0};
+
+    if (!WIZARD_MODE || numberOfItemsInPack() == MAX_PACK_ITEMS) {
+        return;
+    }
+    event.eventType = WIZARD_CREATE_GOLD;
+    recordEvent(&event);
+    theItem = generateItem(GOLD, 0);
+    rogue.gold += theItem->quantity;
+    sprintf(
+        text, "you found %i pieces of gold.%s", theItem->quantity,
+        rogue.featRecord[FEAT_TONE] ? ".. and strike a tone of disappointment." : ""
+    );
+    rogue.featRecord[FEAT_TONE] = false;
+    messageWithColor(text, &itemMessageColor, 0);
+    deleteItem(theItem);
 }
 
 // Display a series of dialog windows for creating an arbitrary item chosen by the user
@@ -441,9 +513,6 @@ static void dialogCreateItem() {
     brogueButton buttons[DIALOG_CREATE_ITEM_MAX_BUTTONS];
     char buttonText[COLS];
     short i, selectedCategory, selectedKind;
-    char message[COLS] = "";
-    item *theItem;
-    char theItemName[100]="";
 
     if (numberOfItemsInPack() == MAX_PACK_ITEMS) {
         messageWithColor("Your pack is already full.", &itemMessageColor, 0);
@@ -465,45 +534,100 @@ static void dialogCreateItem() {
         selectedKind = 0;
     }
 
-    if (selectedKind >= 0) {
-        theItem = generateItem(Fl(selectedCategory), selectedKind);
-        theItem->flags &= ~(ITEM_CURSED); // we'll add a curse later if the item is negatively enchanted
-    } else {
-        return;
-    }
-
-    if (Fl(selectedCategory) == GEM) {
-        theItem->originDepth = rogue.depthLevel;
-    }
-
     if (Fl(selectedCategory) == GOLD) {
-        rogue.gold += theItem->quantity;
-        sprintf(message, "you found %i pieces of gold.%s", theItem->quantity, rogue.featRecord[FEAT_TONE] ? ".. and strike a tone of disappointment." : "");
-        rogue.featRecord[FEAT_TONE] = false;
-        messageWithColor(message, &itemMessageColor, 0);
-        deleteItem(theItem);
+        wizardCreateGold();
         return;
     }
 
-    if (Fl(selectedCategory) & (ARMOR | WEAPON)) {
-        dialogCreateItemChooseRunic(theItem);
-    }
+    if (selectedKind < 0) return;
+    wizardItemOptions options = {0};
+    options.category = selectedCategory;
+    options.kind = selectedKind;
+    options.enchant = WIZARD_DEFAULT_ENCHANT;
+    wizardCreateItem(&options);
+}
 
-    if (Fl(selectedCategory) & CAN_BE_ENCHANTED  && theItem->quiverNumber == 0) {
-        dialogCreateItemChooseEnchantmentLevel(theItem);
+boolean wizardItemOptionsValid(const wizardItemOptions *o) {
+    if (o->category < 0 || o->category >= NUMBER_ITEM_CATEGORIES || Fl(o->category) == GOLD
+        || o->kind < 0 || o->runic < 0
+        || o->vorpalEnemy < 0 || o->vorpalEnemy >= MONSTER_CLASS_COUNT
+        || (o->enchant != WIZARD_DEFAULT_ENCHANT && (o->enchant < -3 || o->enchant > 50))) {
+        return false;
     }
+    enum itemCategory category = Fl(o->category);
+    int count = tableForItemCategory(category) ? itemKindCount(category, 0) : 1;
+    if (o->kind >= count) {
+        return false;
+    }
+    if (category == WEAPON) {
+        if (o->runic >= NUMBER_WEAPON_RUNIC_KINDS) {
+            return false;
+        }
+        if (o->kind >= DART && o->hasRunic) {
+            return false;
+        }
+        if ((o->kind == HAMMER || o->kind == WAR_AXE || o->kind == PIKE || o->kind == BROADSWORD)
+            && o->hasRunic && o->runic < NUMBER_GOOD_WEAPON_ENCHANT_KINDS) {
+            return false;
+        }
+    } else if (category == ARMOR) {
+        if (o->runic >= NUMBER_ARMOR_ENCHANT_KINDS) {
+            return false;
+        }
+        if (o->kind == PLATE_MAIL && o->hasRunic && o->runic < NUMBER_GOOD_ARMOR_ENCHANT_KINDS) {
+            return false;
+        }
+    } else if (o->runic || o->hasRunic) {
+        return false;
+    }
+    if (!(category & CAN_BE_ENCHANTED) && o->enchant != WIZARD_DEFAULT_ENCHANT) {
+        return false;
+    }
+    if ((category & NEVER_IDENTIFIABLE) && o->identify) {
+        return false;
+    }
+    return true;
+}
 
-    if (theItem->flags & ITEM_CAN_BE_IDENTIFIED && !(Fl(selectedCategory) & NEVER_IDENTIFIABLE)) {
-        if (confirm("Identify the item?", false)) {
-            identify(theItem);
+void wizardCreateItem(wizardItemOptions *options) {
+    char text[COLS], name[100];
+    rogueEvent event = {0};
+    if (!WIZARD_MODE || numberOfItemsInPack() == MAX_PACK_ITEMS
+        || !wizardItemOptionsValid(options)) {
+        return;
+    }
+    enum itemCategory category = Fl(options->category);
+    item *theItem = generateItem(category, options->kind);
+    theItem->flags &= ~ITEM_CURSED;
+    if (category == GEM) theItem->originDepth = rogue.depthLevel;
+
+    if (category & (ARMOR | WEAPON)) {
+        if (!rogue.playbackMode) {
+            dialogCreateItemChooseRunic(theItem);
+            options->runic = theItem->enchant2;
+            options->hasRunic = (theItem->flags & ITEM_RUNIC) != 0;
+            options->vorpalEnemy = theItem->vorpalEnemy;
+        } else {
+            theItem->enchant2 = options->runic;
+            if (options->hasRunic) theItem->flags |= ITEM_RUNIC;
+            else theItem->flags &= ~ITEM_RUNIC;
+            theItem->vorpalEnemy = options->vorpalEnemy;
         }
     }
-
+    if ((category & CAN_BE_ENCHANTED) && theItem->quiverNumber == 0) {
+        dialogCreateItemChooseEnchantmentLevel(theItem, options);
+    }
+    if ((theItem->flags & ITEM_CAN_BE_IDENTIFIED) && !(category & NEVER_IDENTIFIABLE)) {
+        if (!rogue.playbackMode) options->identify = confirm("Identify the item?", false);
+        if (options->identify) identify(theItem);
+    }
+    event.eventType = WIZARD_CREATE_ITEM;
+    event.wizardItem = *options;
+    recordEvent(&event);
     theItem = addItemToPack(theItem);
-    itemName(theItem, theItemName, true, true, NULL);
-
-    sprintf(message,"you now have %s (%c).", theItemName, theItem->inventoryLetter);
-    messageWithColor(message, &itemMessageColor, 0);
+    itemName(theItem, name, true, true, NULL);
+    sprintf(text, "you now have %s (%c).", name, theItem->inventoryLetter);
+    messageWithColor(text, &itemMessageColor, 0);
 }
 
 void dialogCreateItemOrMonster() {

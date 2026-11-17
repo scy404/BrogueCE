@@ -46,6 +46,12 @@ void executeEvent(rogueEvent *theEvent) {
     rogue.playbackBetweenTurns = false;
     if (theEvent->eventType == KEYSTROKE) {
         executeKeystroke(theEvent->param1, theEvent->controlKey, theEvent->shiftKey);
+    } else if (theEvent->eventType == WIZARD_CREATE_GOLD) {
+        wizardCreateGold();
+    } else if (theEvent->eventType == WIZARD_CREATE_ITEM) {
+        wizardCreateItem(&theEvent->wizardItem);
+    } else if (theEvent->eventType == WIZARD_CREATE_MONSTER) {
+        wizardCreateMonster(&theEvent->wizardMonster);
     } else if (theEvent->eventType == MOUSE_UP
                || theEvent->eventType == RIGHT_MOUSE_UP) {
         executeMouseClick(theEvent);

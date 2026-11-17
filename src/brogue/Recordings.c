@@ -29,6 +29,8 @@
 
 #define RECORDING_HEADER_LENGTH     36  // bytes at the start of the recording file to store global data
 
+static uint64_t physicalPlaybackLength;
+
 static const long keystrokeTable[] = {UP_ARROW, LEFT_ARROW, DOWN_ARROW, RIGHT_ARROW,
     ESCAPE_KEY, RETURN_KEY, DELETE_KEY, TAB_KEY, NUMPAD_0, NUMPAD_1,
     NUMPAD_2, NUMPAD_3, NUMPAD_4, NUMPAD_5, NUMPAD_6, NUMPAD_7, NUMPAD_8, NUMPAD_9};
@@ -95,7 +97,12 @@ static void recordNumber(unsigned long number, short numberOfBytes) {
 
 // Events are recorded as follows:
 // Keystrokes: Event type, keystroke value, modifier flags. (3 bytes.)
-// All other events: Event type, x-coordinate of the event, y-coordinate of the event, modifier flags. (4 bytes.)
+// Wizard gold creation: Event type only. (1 byte; no parameters or modifiers.)
+// Wizard item: type, category index, kind, runic index, vorpal enemy,
+// enchant+128 (0 means default), flags (bit 0: identify, bit 1: runic). (7 bytes.)
+// Mouse events: Event type, x-coordinate, y-coordinate, modifier flags. (4 bytes.)
+// Wizard monster: type, kind (2 bytes, big endian), mutation+1,
+// x, y, outcome, ally (0/1). (8 bytes.)
 // Note: these must be sanitized, because user input may contain more than one byte per parameter.
 void recordEvent(rogueEvent *event) {
     unsigned char c;
@@ -104,7 +111,41 @@ void recordEvent(rogueEvent *event) {
         return;
     }
 
+    if (event->eventType == WIZARD_CREATE_GOLD || event->eventType == WIZARD_CREATE_ITEM
+        || event->eventType == WIZARD_CREATE_MONSTER) {
+        rogue.wizardRecordingEvents = true;
+    }
+
     recordChar((unsigned char) event->eventType);
+
+    if (event->eventType == WIZARD_CREATE_MONSTER) {
+        const wizardMonsterOptions *o = &event->wizardMonster;
+        recordNumber(o->kind, 2);
+        recordChar(o->mutation + 1);
+        recordChar(o->location.x);
+        recordChar(o->location.y);
+        recordChar(o->outcome);
+        recordChar(o->ally);
+        considerFlushingBufferToFile();
+        return;
+    }
+
+    if (event->eventType == WIZARD_CREATE_ITEM) {
+        const wizardItemOptions *o = &event->wizardItem;
+        recordChar(o->category);
+        recordChar(o->kind);
+        recordChar(o->runic);
+        recordChar(o->vorpalEnemy);
+        recordChar(o->enchant + 128);
+        recordChar((o->identify ? 1 : 0) | (o->hasRunic ? 2 : 0));
+        considerFlushingBufferToFile();
+        return;
+    }
+
+    if (event->eventType == WIZARD_CREATE_GOLD) {
+        considerFlushingBufferToFile();
+        return;
+    }
 
     if (event->eventType == KEYSTROKE) {
         // record which key
@@ -174,6 +215,21 @@ void recordMouseClick(short x, short y, boolean controlKey, boolean shiftKey) {
     recordEvent(&theEvent);
 }
 
+// Keep the variant and version, adding W while removing the first space so the
+// marker still fits the existing 15-byte field. Old readers reject this version.
+static void wizardRecordingVersion(char *version) {
+    const char *source = gameConst->recordingVersionString;
+    int i = 1;
+    boolean removedSpace = false;
+    version[0] = 'W';
+    while (*source && i < 15) {
+        if (*source == ' ' && !removedSpace) removedSpace = true;
+        else version[i++] = *source;
+        source++;
+    }
+    version[i] = '\0';
+}
+
 static void writeHeaderInfo(char *path) {
     unsigned char c[RECORDING_HEADER_LENGTH];
     short i;
@@ -187,6 +243,12 @@ static void writeHeaderInfo(char *path) {
     // Note the version string to gracefully deny compatibility when necessary.
     for (i = 0; rogue.versionString[i] != '\0'; i++) {
         c[i] = rogue.versionString[i];
+    }
+    if (rogue.wizardRecordingEvents) {
+        char version[16];
+        wizardRecordingVersion(version);
+        memset(c, 0, 15);
+        memcpy(c, version, strlen(version));
     }
     c[15] = rogue.mode;
     i = 16;
@@ -337,16 +399,79 @@ static void playbackPanic() {
     }
 }
 
+static boolean recordingBytesAvailable(int count) {
+    return recordingLocation <= lengthOfPlaybackFile
+        && (uint64_t) recordingLocation <= physicalPlaybackLength
+        && (uint64_t) count <= lengthOfPlaybackFile - recordingLocation
+        && (uint64_t) count <= physicalPlaybackLength - recordingLocation;
+}
+
 void recallEvent(rogueEvent *event) {
     unsigned char c;
     boolean tryAgain;
 
     do {
         tryAgain = false;
+        if (!recordingBytesAvailable(1)) {
+            event->eventType = EVENT_ERROR;
+            playbackPanic();
+            return;
+        }
         c = recallChar();
         event->eventType = c;
 
         switch (c) {
+            case WIZARD_CREATE_MONSTER:
+                event->param1 = event->param2 = 0;
+                event->controlKey = event->shiftKey = false;
+                if (!recordingBytesAvailable(7)) {
+                    event->eventType = EVENT_ERROR;
+                    playbackPanic();
+                    return;
+                }
+                event->wizardMonster.kind = recallNumber(2);
+                event->wizardMonster.mutation = (short) recallChar() - 1;
+                event->wizardMonster.location.x = recallChar();
+                event->wizardMonster.location.y = recallChar();
+                event->wizardMonster.outcome = recallChar();
+                c = recallChar();
+                event->wizardMonster.ally = c == 1;
+                if (c > 1 || !WIZARD_MODE || !wizardMonsterOptionsValid(&event->wizardMonster)) {
+                    event->eventType = EVENT_ERROR;
+                    playbackPanic();
+                }
+                return;
+            case WIZARD_CREATE_ITEM:
+                event->param1 = event->param2 = 0;
+                event->controlKey = event->shiftKey = false;
+                if (!recordingBytesAvailable(6)) {
+                    event->eventType = EVENT_ERROR;
+                    playbackPanic();
+                    return;
+                }
+                event->wizardItem.category = recallChar();
+                event->wizardItem.kind = recallChar();
+                event->wizardItem.runic = recallChar();
+                event->wizardItem.vorpalEnemy = recallChar();
+                event->wizardItem.enchant = (short) recallChar() - 128;
+                c = recallChar();
+                event->wizardItem.identify = (c & 1) != 0;
+                event->wizardItem.hasRunic = (c & 2) != 0;
+                if (c > 3 || !WIZARD_MODE || numberOfItemsInPack() == MAX_PACK_ITEMS
+                    || !wizardItemOptionsValid(&event->wizardItem)) {
+                    event->eventType = EVENT_ERROR;
+                    playbackPanic();
+                }
+                return;
+            case WIZARD_CREATE_GOLD:
+                // This command has no payload and must never apply to a normal game.
+                event->param1 = event->param2 = 0;
+                event->controlKey = event->shiftKey = false;
+                if (!WIZARD_MODE || numberOfItemsInPack() == MAX_PACK_ITEMS) {
+                    event->eventType = EVENT_ERROR;
+                    playbackPanic();
+                }
+                return;
             case KEYSTROKE:
                 // record which key
                 event->param1 = uncompressKeystroke(recallChar());
@@ -486,18 +611,36 @@ void initRecording() {
     rogue.nextAnnotation[0]     = '\0';
     rogue.locationInAnnotationFile  = 0;
     rogue.patchVersion          = 0;
+    rogue.wizardRecordingEvents = false;
 
     if (rogue.playbackMode) {
         lengthOfPlaybackFile        = 100000; // so recall functions don't freak out
         rogue.playbackDelayThisTurn = rogue.playbackDelayPerTurn;
         rogue.playbackPaused        = false;
 
+        // A valid declared length cannot make bytes beyond physical EOF valid.
+        physicalPlaybackLength = 0;
+        recordFile = fopen(currentFilePath, "rb");
+        if (recordFile) {
+            if (fseek(recordFile, 0, SEEK_END) == 0) {
+                int64_t fileLength = ftell(recordFile);
+                if (fileLength >= 0) physicalPlaybackLength = (uint64_t) fileLength;
+            }
+            fclose(recordFile);
+        }
         fillBufferFromFile();
 
         for (i=0; i<15; i++) {
             versionString[i] = recallChar();
         }
         rogue.mode = recallChar();
+        versionString[15] = '\0';
+        char wizardVersion[16];
+        wizardRecordingVersion(wizardVersion);
+        if (rogue.mode == GAME_MODE_WIZARD && !strcmp(versionString, wizardVersion)) {
+            rogue.wizardRecordingEvents = true;
+            strcpy(versionString, gameConst->recordingVersionString);
+        }
 
         if (getPatchVersion(versionString, &recPatch) && recPatch <= gameConst->patchVersion) {
             // Major and Minor match ours, Patch is less than or equal to ours: we are compatible.
@@ -1468,6 +1611,31 @@ void parseFile() {
             startLoc = recordingLocation;
             c = recallChar();
             switch (c) {
+                case WIZARD_CREATE_MONSTER: {
+                    int kind = (int) recallNumber(2);
+                    int mutation = (short) recallChar() - 1;
+                    unsigned char x = recallChar(), y = recallChar();
+                    unsigned char outcome = recallChar(), ally = recallChar();
+                    sprintf(
+                        description, "Wizard monster: kind %d, mutation %d, location (%u,%u), "
+                        "outcome %u, ally %u", kind, mutation, x, y, outcome, ally
+                    );
+                    break;
+                }
+                case WIZARD_CREATE_ITEM: {
+                    unsigned char category = recallChar(), kind = recallChar();
+                    unsigned char runic = recallChar(), enemy = recallChar();
+                    unsigned char enchant = recallChar(), identified = recallChar();
+                    sprintf(
+                        description, "Wizard item: category %u, kind %u, runic %u, enemy %u, "
+                        "enchant %d, flags %u", category, kind, runic, enemy,
+                        (int) enchant - 128, identified
+                    );
+                    break;
+                }
+                case WIZARD_CREATE_GOLD:
+                    sprintf(description, "Wizard: create gold");
+                    break;
                 case KEYSTROKE:
                     describeKeystroke(recallChar(), description);
                     appendModifierKeyDescription(description);
